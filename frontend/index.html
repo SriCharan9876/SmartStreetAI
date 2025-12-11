@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>City Surveillance – AI Vision</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>City Surveillance — Civic Issue Detection</h1>
+    </header>
+
+    <section class="card">
+      <form id="uploadForm" class="row">
+        <input type="file" id="videoInput" accept="video/*" required />
+        <button type="submit" class="btn primary">Upload & Analyze</button>
+      </form>
+      <div id="status" class="status">Idle</div>
+    </section>
+
+    <section class="card">
+      <h2>Original Video</h2>
+      <video id="originalVideo" controls class="media"></video>
+    </section>
+
+    <section class="card">
+      <h2>Annotated Video (AI Output)</h2>
+
+      <!-- Download button — hidden until result arrives -->
+      <div class="controls">
+        <a id="downloadLink" href="#" target="_blank" rel="noopener" download>
+          <button id="downloadBtn" class="btn" style="display:none">Download annotated video</button>
+        </a>
+      </div>
+
+    </section>
+
+    <section class="card">
+      <h2>Detection Summary</h2>
+      <div id="summaryFriendly">No results yet.</div>
+      <pre id="summary" class="raw" style="display:none"></pre>
+    </section>
+
+    <footer class="foot">
+      <small>Local demo • NodeJS + YOLO (on-prem)</small>
+    </footer>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
