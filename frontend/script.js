@@ -67,7 +67,6 @@ function renderSummary(summary) {
     <div class="section">
       <h3>🚗 Vehicles</h3>
       <ul>
-        <li>Total detections: <b>${vehicles.total_detections ?? 0}</b></li>
         <li>Illegal parked vehicles: <b>${vehicles.illegal_parked ?? 0}</b></li>
       </ul>
     </div>
