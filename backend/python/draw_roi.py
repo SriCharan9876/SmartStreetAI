@@ -61,9 +61,9 @@ while True:
     key = cv2.waitKey(0) & 0xFF
     if key == ord('s'):
         os.makedirs("python/roi_output", exist_ok=True)
-        with open("python/roi_output/roi.json", "w") as f:
+        with open("python/roi_output/parking_roi.json", "w") as f:
             json.dump({"points": points}, f)
-        print("Saved ROI → python/roi_output/roi.json")
+        print("Saved ROI → python/roi_output/parking_roi.json")
         break
     elif key == ord('r'):
         points.clear()

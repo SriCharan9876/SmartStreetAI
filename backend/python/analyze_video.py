@@ -86,7 +86,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', required=True)
     parser.add_argument('--output', required=True)
-    parser.add_argument('--model', default='yolov8n.pt')
+    parser.add_argument('--model', default='yolov8s.pt')
     parser.add_argument('--parking_roi', default='python/roi_output/parking_roi.json')
     parser.add_argument('--crowd_roi', default='python/roi_output/crowd_roi.json')
     parser.add_argument('--conf', type=float, default=0.35)
@@ -94,11 +94,11 @@ def main():
     args = parser.parse_args()
 
     # -------- thresholds --------
-    PARKING_TIME_THRESHOLD = 2.0
-    MOVEMENT_THRESHOLD = 20
+    PARKING_TIME_THRESHOLD = 3.0
+    MOVEMENT_THRESHOLD = 1
 
     CROWD_COUNT_THRESHOLD = 5
-    CROWD_TIME_THRESHOLD = 2.0
+    CROWD_TIME_THRESHOLD = 1.0
 
     model = YOLO(args.model)
 
