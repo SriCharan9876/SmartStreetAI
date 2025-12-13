@@ -3,176 +3,300 @@ import argparse
 import json
 import sys
 import time
-from collections import defaultdict
 import os
+import math
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
+# ------------------------------
+# stderr logging (Node-safe)
+# ------------------------------
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
+# ------------------------------
+# Simple Centroid Tracker (UNCHANGED)
+# ------------------------------
+class CentroidTracker:
+    def __init__(self, max_disappeared=15, max_distance=80):
+        self.next_id = 1
+        self.objects = {}
+        self.seen_count = {}
+        self.disappeared = {}
+        self.max_disappeared = max_disappeared
+        self.max_distance = max_distance
+
+    def update(self, detections):
+        if not detections:
+            for oid in list(self.objects.keys()):
+                self.disappeared[oid] += 1
+                if self.disappeared[oid] > self.max_disappeared:
+                    self._deregister(oid)
+            return self.objects
+
+        if not self.objects:
+            for d in detections:
+                self._register(d)
+            return self.objects
+
+        used = set()
+        for oid, (ox, oy) in list(self.objects.items()):
+            best, best_dist = None, None
+            for d in detections:
+                if d in used:
+                    continue
+                dist = math.hypot(ox - d[0], oy - d[1])
+                if dist < self.max_distance and (best_dist is None or dist < best_dist):
+                    best, best_dist = d, dist
+
+            if best:
+                self.objects[oid] = best
+                self.seen_count[oid] += 1
+                self.disappeared[oid] = 0
+                used.add(best)
+            else:
+                self.disappeared[oid] += 1
+                if self.disappeared[oid] > self.max_disappeared:
+                    self._deregister(oid)
+
+        for d in detections:
+            if d not in used:
+                self._register(d)
+
+        return self.objects
+
+    def _register(self, centroid):
+        oid = self.next_id
+        self.next_id += 1
+        self.objects[oid] = centroid
+        self.seen_count[oid] = 1
+        self.disappeared[oid] = 0
+
+    def _deregister(self, oid):
+        self.objects.pop(oid, None)
+        self.seen_count.pop(oid, None)
+        self.disappeared.pop(oid, None)
+
+# ------------------------------
+# Main
+# ------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input', required=True, help='Input video path')
-    parser.add_argument('--output', required=True, help='Output (annotated) video path')
-    parser.add_argument('--model', default='yolov8n.pt', help='YOLO model weights (default: yolov8n.pt)')
-    parser.add_argument('--roi_fraction', default=0.6, type=float, help='start of ROI as fraction of frame height')
-    parser.add_argument('--stay_frames_threshold', default=30, type=int, help='frames threshold to count as "staying"')
+    parser.add_argument('--input', required=True)
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--model', default='yolov8n.pt')
+    parser.add_argument('--parking_roi', default='python/roi_output/parking_roi.json')
+    parser.add_argument('--crowd_roi', default='python/roi_output/crowd_roi.json')
+    parser.add_argument('--conf', type=float, default=0.35)
+    parser.add_argument('--min_seen_frames', type=int, default=3)
     args = parser.parse_args()
 
-    eprint(f"analyze_video.py start | input={args.input} output={args.output} model={args.model}")
+    # -------- thresholds --------
+    PARKING_TIME_THRESHOLD = 2.0
+    MOVEMENT_THRESHOLD = 20
 
-    # Load model
-    try:
-        model = YOLO(args.model)
-    except Exception as e:
-        eprint("Failed to load YOLO model:", e)
-        eprint(json.dumps({"error": "failed_to_load_model", "details": str(e)}))
-        sys.exit(2)
+    CROWD_COUNT_THRESHOLD = 5
+    CROWD_TIME_THRESHOLD = 2.0
 
-    # Open video
+    model = YOLO(args.model)
+
+    # -------- Load ROIs --------
+    parking_roi = None
+    crowd_roi = None
+
+    if os.path.exists(args.parking_roi):
+        with open(args.parking_roi) as f:
+            parking_roi = np.array(json.load(f)["points"], dtype=np.int32)
+
+    if os.path.exists(args.crowd_roi):
+        with open(args.crowd_roi) as f:
+            crowd_roi = np.array(json.load(f)["points"], dtype=np.int32)
+
     cap = cv2.VideoCapture(args.input)
-    if not cap.isOpened():
-        eprint("Failed to open input:", args.input)
-        eprint(json.dumps({"error": "failed_to_open_input", "path": args.input}))
-        sys.exit(3)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+    out_path = args.output.replace(".mp4", ".avi")
+    out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'XVID'), fps, (w, h))
 
-    # Use AVI/XVID output for best cross-browser behavior with OpenCV
-    # Ensure output path ends with .avi
-    out_path = args.output
-    if out_path.lower().endswith('.mp4'):
-        out_path = out_path[:-4] + '.avi'
+    tracker = CentroidTracker()
 
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+    # -------- parking state (UNCHANGED) --------
+    first_seen_ts = {}
+    last_position = {}
+    stationary_time = {}
+    flagged_ids = set()
+    last_boxes = {}
 
-    roi_y_start = int(height * args.roi_fraction)
-    grid_size = max(40, int(min(width, height) * 0.05))
-    seen_in_cell = defaultdict(int)
-    cell_flagged_ts = {}
+    # -------- crowd state --------
+    crowd_start_ts = None
+    crowd_reported = False
+
     issue_events = []
-    vehicle_detections_total = 0
     frame_idx = 0
     start_time = time.time()
+    total_vehicle_detections = 0
+    max_people_detected = 0
 
-    # Common COCO vehicle labels (ultralytics names for COCO)
     vehicle_labels = {'car', 'bus', 'truck', 'motorbike', 'motorcycle'}
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_idx += 1
+    # ==============================
+    # Frame loop
+    # ==============================
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_idx += 1
+        last_boxes.clear()
 
-            # draw ROI rectangle for visualization
-            cv2.rectangle(frame, (0, roi_y_start), (width, height), (255, 0, 0), 2)
+        results = model(frame)
+        res0 = results[0]
 
-            # Run model inference on the frame
-            results = model(frame)               # ultralytics returns a Results object (list-like)
-            res0 = results[0] if isinstance(results, (list, tuple)) else results
+        vehicle_detections = []
+        people_count = 0
 
-            # If no detections, just write frame
-            if not getattr(res0, 'boxes', None):
-                out.write(frame)
-                continue
-
-            # Iterate over detected boxes
+        if res0.boxes:
             for box in res0.boxes:
-                # xyxy as [x1, y1, x2, y2]
-                try:
-                    xyxy = box.xyxy[0].tolist()
-                except Exception:
-                    # if structure differs, skip this box
+                conf = float(box.conf[0])
+                if conf < args.conf:
                     continue
 
-                x1, y1, x2, y2 = map(int, xyxy[:4])
+                cls_id = int(box.cls[0])
+                label = res0.names[cls_id]
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cx, cy = (x1+x2)//2, (y1+y2)//2
 
-                # class id and confidence
-                try:
-                    cls_id = int(box.cls[0].item())
-                    conf = float(box.conf[0].item())
-                except Exception:
-                    # fallback defaults
-                    cls_id = None
-                    conf = 0.0
-
-                label = res0.names[cls_id] if (hasattr(res0, 'names') and cls_id is not None and cls_id in res0.names) else str(cls_id)
-
-                # draw bbox and label
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f"{label} {conf:.2f}", (x1, max(15, y1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-
-                # Vehicle-specific logic
+                # -------- VEHICLES --------
                 if label in vehicle_labels:
-                    vehicle_detections_total += 1
-                    cx = int((x1 + x2) / 2)
-                    cy = int((y1 + y2) / 2)
-                    cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+                    total_vehicle_detections += 1
 
-                    # Check ROI (no-parking zone)
-                    if cy >= roi_y_start:
-                        cell_x = cx // grid_size
-                        cell_y = cy // grid_size
-                        cell_key = (cell_x, cell_y)
-                        seen_in_cell[cell_key] += 1
+                    if parking_roi is not None and cv2.pointPolygonTest(parking_roi, (cx,cy), False) >= 0:
+                        vehicle_detections.append((cx,cy))
+                        last_boxes[(cx,cy)] = (x1,y1,x2,y2,label,conf)
+                    else:
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
+                        cv2.putText(frame,f"{label} {conf:.2f}",
+                                    (x1,y1-5),cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.45,(0,255,0),1)
 
-                        if seen_in_cell[cell_key] >= args.stay_frames_threshold:
-                            last_flag_ts = cell_flagged_ts.get(cell_key, 0)
-                            if time.time() - last_flag_ts > 5.0:
-                                ev = {
-                                    "frame": frame_idx,
-                                    "type": "illegal_parking",
-                                    "cell": {"x": cell_x, "y": cell_y},
-                                    "message": f"Vehicle detected staying in ROI for >= {args.stay_frames_threshold} frames"
-                                }
-                                issue_events.append(ev)
-                                cell_flagged_ts[cell_key] = time.time()
+                # -------- PEOPLE (crowd) --------
+                if label == "person":
+                    if crowd_roi is not None and cv2.pointPolygonTest(crowd_roi,(cx,cy),False)>=0:
+                        people_count += 1
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),(255,165,0),2)
+                        cv2.putText(frame,f"person {conf:.2f}",
+                                    (x1,y1-5),cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.45,(255,165,0),1)
 
-            # occasional decay of counts to avoid stale accumulation
-            if frame_idx % 30 == 0:
-                for k in list(seen_in_cell.keys()):
-                    seen_in_cell[k] = max(0, seen_in_cell[k] - 2)
-                    if seen_in_cell[k] == 0:
-                        del seen_in_cell[k]
+        # -------- Illegal parking (UNCHANGED) --------
+        tracked = tracker.update(vehicle_detections)
+        now = time.time()
 
-            # write annotated frame
-            out.write(frame)
+        for oid,(cx,cy) in tracked.items():
+            if tracker.seen_count[oid] < args.min_seen_frames:
+                continue
 
-    except Exception as e:
-        eprint("Runtime error:", str(e))
-        eprint(json.dumps({"error": "runtime_failure", "details": str(e)}))
-        cap.release()
-        out.release()
-        sys.exit(4)
+            nearest, best = None, None
+            for (px,py),box in last_boxes.items():
+                d = math.hypot(px-cx, py-cy)
+                if best is None or d < best:
+                    nearest, best = box, d
+            if not nearest:
+                continue
+
+            x1,y1,x2,y2,label,conf = nearest
+
+            if oid not in first_seen_ts:
+                first_seen_ts[oid] = now
+                last_position[oid] = (cx,cy)
+                stationary_time[oid] = 0
+                continue
+
+            px,py = last_position[oid]
+            movement = math.hypot(cx-px, cy-py)
+            dt = now - first_seen_ts[oid]
+
+            if movement < MOVEMENT_THRESHOLD:
+                stationary_time[oid] += dt
+            else:
+                stationary_time[oid] = 0
+
+            first_seen_ts[oid] = now
+            last_position[oid] = (cx,cy)
+
+            if stationary_time[oid] >= PARKING_TIME_THRESHOLD:
+                if oid not in flagged_ids:
+                    flagged_ids.add(oid)
+                    issue_events.append({
+                        "type":"illegal_parking",
+                        "vehicle_id":oid,
+                        "duration_seconds":round(stationary_time[oid],2)
+                    })
+
+                cv2.rectangle(frame,(x1,y1),(x2,y2),(0,0,255),2)
+                cv2.putText(frame,f"ILLEGAL PARKING | ID {oid}",
+                            (x1,y1-8),cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,(0,0,255),2)
+            else:
+                cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,255),2)
+                cv2.putText(frame,"PARKING CHECK…",
+                            (x1,y1-8),cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,(0,255,255),2)
+
+        # -------- Crowd logic --------
+        max_people_detected = max(max_people_detected, people_count)
+
+        if people_count >= CROWD_COUNT_THRESHOLD:
+            if crowd_start_ts is None:
+                crowd_start_ts = now
+            elif now - crowd_start_ts >= CROWD_TIME_THRESHOLD and not crowd_reported:
+                crowd_reported = True
+                issue_events.append({
+                    "type":"street_crowding",
+                    "people_count":people_count,
+                    "duration_seconds":round(now-crowd_start_ts,2)
+                })
+                cv2.putText(frame,"STREET CROWDING",
+                            (40,50),cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9,(0,0,255),3)
+        else:
+            crowd_start_ts = None
+            crowd_reported = False
+
+        # -------- Draw ROIs --------
+        if parking_roi is not None:
+            cv2.polylines(frame,[parking_roi],True,(255,0,0),2)
+        if crowd_roi is not None:
+            cv2.polylines(frame,[crowd_roi],True,(255,165,0),2)
+
+        out.write(frame)
 
     cap.release()
     out.release()
+
     elapsed = time.time() - start_time
 
-    # Build summary - ensure output path returned is the actual file written
     summary = {
-        "input": args.input,
+        "input": os.path.abspath(args.input),
         "output": os.path.abspath(out_path),
         "frame_count_processed": frame_idx,
-        "fps_used": fps,
-        "resolution": {"width": width, "height": height},
-        "vehicle_detections_total": vehicle_detections_total,
+        "vehicles": {
+            "total_detections": total_vehicle_detections,
+            "illegal_parked": len(flagged_ids)
+        },
+        "crowd": {
+            "max_people_detected": max_people_detected
+        },
         "issues": issue_events,
-        "illegal_parking_count": sum(1 for e in issue_events if e.get("type") == "illegal_parking"),
-        "processing_time_seconds": elapsed
+        "processing_time_seconds": round(elapsed,2)
     }
 
-    # Print only this JSON to stdout
     print(json.dumps(summary))
-    sys.stdout.flush()
     sys.exit(0)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
