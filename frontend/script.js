@@ -4,17 +4,18 @@ const backend = 'http://localhost:3000'; // change if deployed
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
+
   const fileInput = document.getElementById('videoInput');
   if (!fileInput.files[0]) return;
 
-  // preview original
+  // Preview original video
   const originalVideo = document.getElementById('originalVideo');
   originalVideo.src = URL.createObjectURL(fileInput.files[0]);
 
   const formData = new FormData();
   formData.append('video', fileInput.files[0]);
 
-  statusDiv.innerText = 'Uploading and analyzing...';
+  statusDiv.innerText = 'Uploading & analyzing…';
 
   try {
     const res = await fetch(`${backend}/api/analyze-video`, {
@@ -23,34 +24,25 @@ form.addEventListener('submit', async (e) => {
     });
 
     if (!res.ok) {
-      const text = await res.text();
-      statusDiv.innerText = `Server error: ${res.status} ${res.statusText}`;
-      console.error('Server response (non-ok):', text);
+      statusDiv.innerText = `Server error (${res.status})`;
+      console.error(await res.text());
       return;
     }
 
     const data = await res.json();
-    statusDiv.innerText = data.message || 'Analysis complete';
+    console.log(data.summary);
+    statusDiv.innerText = 'Analysis complete';
 
-    // annotated URL from backend (already starts with /processed/...)
-    const annotatedUrl = backend + data.annotatedVideoUrl;
-    console.log('Annotated URL:', annotatedUrl);
-    console.log('Summary:', data.summary);
-
-    // show download button and set href
+    // Download link
     const downloadLink = document.getElementById('downloadLink');
     const downloadBtn = document.getElementById('downloadBtn');
-
-    // If backend returned an AVI or MP4, leave as-is. Otherwise, attempt .avi fallback
-    downloadLink.href = annotatedUrl;
-    downloadLink.style.display = 'inline-block';
+    downloadLink.href = backend + data.annotatedVideoUrl;
     downloadBtn.style.display = 'inline-block';
-
-    // render summary friendly
+    
     renderSummary(data.summary);
   } catch (err) {
-    console.error('Upload/analysis failed:', err);
-    statusDiv.innerText = 'Upload/analysis failed. See console.';
+    console.error(err);
+    statusDiv.innerText = 'Upload / analysis failed';
   }
 });
 
@@ -60,31 +52,52 @@ function renderSummary(summary) {
   raw.style.display = 'none';
 
   if (!summary) {
-    friendly.innerText = 'No summary returned.';
+    friendly.innerHTML = '<p>No summary returned.</p>';
     return;
   }
 
-  const rows = [
-    ['Frames processed', summary.frame_count_processed ?? summary.frame_count ?? '?'],
-    ['FPS used', summary.fps_used ?? summary.fps ?? '?'],
-    ['Resolution', (summary.resolution && (summary.resolution.width + '×' + summary.resolution.height)) || '?'],
-    ['Total vehicle detections', summary.vehicle_detections_total ?? '?'],
-    ['Illegal parking events', summary.illegal_parking_count ?? (summary.issues ? summary.issues.filter(i=>i.type==='illegal_parking').length : 0)]
-  ];
+  const vehicles = summary.vehicles || {};
+  const crowd = summary.crowd || {};
+  const issues = summary.issues || [];
 
-  let html = '<table id="summaryTable"><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>';
-  for (const r of rows) html += `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`;
-  html += '</tbody></table>';
+  let html = '';
 
-  if (summary.issues && summary.issues.length) {
-    html += '<h3>Detected issues</h3><ul>';
-    for (const it of summary.issues) {
-      html += `<li><strong>${it.type}</strong> — frame ${it.frame} — ${it.message || JSON.stringify(it)}</li>`;
-    }
-    html += '</ul>';
+  // ---- Vehicles ----
+  html += `
+    <div class="section">
+      <h3>🚗 Vehicles</h3>
+      <ul>
+        <li>Total detections: <b>${vehicles.total_detections ?? 0}</b></li>
+        <li>Illegal parked vehicles: <b>${vehicles.illegal_parked ?? 0}</b></li>
+      </ul>
+    </div>
+  `;
+
+  // ---- Crowd ----
+  html += `
+    <div class="section">
+      <h3>👥 Crowd</h3>
+      <ul>
+        <li>Max people detected in ROI: <b>${crowd.max_people_detected ?? 0}</b></li>
+      </ul>
+    </div>
+  `;
+
+  // ---- Issues ----
+  html += `<div class="section"><h3>⚠️ Detected Issues</h3>`;
+  if (issues.length === 0) {
+    html += `<p class="muted">No civic issues detected.</p>`;
   } else {
-    html += '<p>No issues detected (based on current heuristic).</p>';
+    html += `<ul class="issues">`;
+    issues.forEach((i, idx) => {
+      html += `<li>
+        <span class="badge ${i.type}">${i.type}</span>
+        <span class="issue-text">#${idx + 1}</span>
+      </li>`;
+    });
+    html += `</ul>`;
   }
+  html += `</div>`;
 
   friendly.innerHTML = html;
   raw.innerText = JSON.stringify(summary, null, 2);
